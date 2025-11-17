@@ -2,13 +2,16 @@
 ・NVIDIA 提供の BCM head node AMI から EC2 を起動する
 
 ・ライセンスは すでに発行済みの cluster.pem（署名済みライセンスファイル） を使って設定する
+ライセンス証書の配置先 /cm/local/apps/cmd/etc/：第 4章冒頭（頁 48あたり）
 
 起動後の流れ
 ・マニュアルでも request-license で取得
  → install-license <signedlicense> でインストールする流れになっていますNVIDIA Docs+1
+request-license／install-license の記載：同じく 第 4章 4.3節（頁 51〜57あたり）
 
 ・verify-license コマンドでライセンスが有効かどうか判定できるので、
-それを使って「すでに有効ならスキップ」という idempotent な動きにしますNVIDIA Docs
+それを使って「すでに有効ならスキップ」という idempotent な動きにします
+verify-license の記載：Installation Manual v10 第 4章 4.2節（頁 49〜51あたり）
 
 UserData（cloud-init）YAML 例
 ※ ここでは簡単のために「ライセンスファイル cluster.pem をあらかじめ AMI 内か、別の仕組み（S3 / EFS / 手動コピー等）で /cm/local/apps/cmd/etc/cluster.pem に置く」前提にしています。
