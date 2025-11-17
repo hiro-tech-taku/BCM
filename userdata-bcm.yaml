@@ -1,0 +1,333 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+repo_update: true
+repo_upgrade: all
+timezone: Asia/Tokyo
+
+packages:
+  - awscli2
+  - chrony
+  - cloud-init
+  - docker
+  - dnf-automatic
+  - firewalld
+  - git
+  - jq
+  - kernel-devel
+  - kernel-headers
+  - lvm2
+  - nfs-utils
+  - python3
+  - python3-pip
+  - unzip
+
+write_files:
+  - path: /etc/nvidia-bcm/bcm-userdata.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      # Base Command Manager (BCM) bootstrap defaults. Override before launching.
+      BCM_LICENSE_METHOD=ssm-parameter
+      BCM_LICENSE_PARAMETER_NAME=/bcm/license
+      # When using Secrets Manager instead:
+      # BCM_LICENSE_SECRET_ARN=arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:bcm/license
+      # Provide inline license text (base64 or plain) only for test use.
+      BCM_LICENSE_TEXT=
+      BCM_LICENSE_TARGET_DIR=/opt/nvidia/bcm/license
+      # Control whether AMIからのリストア時にライセンス処理を自動スキップする
+      BCM_SKIP_LICENSE_ON_AMI_RESTORE=yes
+      # ライセンス状態ファイルの保存パス
+      BCM_LICENSE_STATE_DIR=/var/lib/nvidia-bcm
+      # Optional RPM that registers the official NVIDIA Base Command Manager repo.
+      BCM_REPO_RPM=
+      # Optional custom installer URL (S3, HTTPS, etc.). Leave empty to rely on repo packages.
+      BCM_INSTALLER_URL=
+      # Optional binary that indicates BCM installer success.
+      BCM_INSTALL_CHECK=/opt/nvidia/bcm/bin/bcmctl
+      # Space separated list of BCM packages to install when using repo packages.
+      BCM_PACKAGES="nvidia-bcm-server nvidia-bcm-cli"
+      # Space separated BCM services to enable after installation.
+      BCM_SYSTEMD_SERVICES="nvidia-bcm-api nvidia-bcm-monitor"
+      # Set to yes to force reinstall of NVIDIA driver even when detected.
+      BCM_FORCE_DRIVER_INSTALL=no
+  - path: /etc/systemd/system/bcm-bootstrap.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=NVIDIA Base Command Manager bootstrap (cloud-init)
+      After=network-online.target cloud-init.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/bcm-bootstrap.sh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/bin/bcm-bootstrap.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      umask 022
+
+      LOG_FILE=/var/log/bcm-bootstrap.log
+      exec >> "${LOG_FILE}" 2>&1
+
+      trap 'echo "$(date --iso-8601=seconds) [ERROR] bootstrap aborted on line ${LINENO}" >&2' ERR
+
+      log() {
+        printf '%s %s\n' "$(date --iso-8601=seconds)" "$*"
+      }
+
+      BCM_USERDATA_FILE=/etc/nvidia-bcm/bcm-userdata.conf
+
+      load_userdata_vars() {
+        if [[ -f "${BCM_USERDATA_FILE}" ]]; then
+          # shellcheck disable=SC1091
+          source "${BCM_USERDATA_FILE}"
+        fi
+      }
+
+      request_imds_token() {
+        curl -fsS -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+          "http://169.254.169.254/latest/api/token"
+      }
+
+      imds() {
+        local path=$1
+        if [[ -n "${IMDS_TOKEN:-}" ]]; then
+          curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
+            "http://169.254.169.254/latest/${path}"
+        else
+          curl -fsS "http://169.254.169.254/latest/${path}"
+        fi
+      }
+
+      load_userdata_vars
+      IMDS_TOKEN="$(request_imds_token || true)"
+      INSTANCE_ID="$(imds meta-data/instance-id)"
+      REGION_DOC="$(imds dynamic/instance-identity/document)"
+      if command -v jq >/dev/null 2>&1; then
+        REGION="$(jq -r '.region' <<<"${REGION_DOC}")"
+      else
+        REGION="$(python3 - <<'PY'
+import json,sys
+print(json.load(sys.stdin).get('region','us-east-1'))
+PY
+)"
+      fi
+
+      LICENSE_STATE_DIR="${BCM_LICENSE_STATE_DIR:-/var/lib/nvidia-bcm}"
+      mkdir -p "${LICENSE_STATE_DIR}"
+      SOURCE_ID_FILE="${LICENSE_STATE_DIR}/source-instance-id"
+      SKIP_FILE="${LICENSE_STATE_DIR}/skip-license-on-ami"
+      ACTIVATED_FILE="${LICENSE_STATE_DIR}/license-activated"
+
+      detect_ami_restore() {
+        if [[ ! -f "${SOURCE_ID_FILE}" ]]; then
+          echo "${INSTANCE_ID}" > "${SOURCE_ID_FILE}"
+          return
+        fi
+
+        local stored
+        stored="$(cat "${SOURCE_ID_FILE}")"
+        if [[ "${stored}" != "${INSTANCE_ID}" ]]; then
+          if [[ "${BCM_SKIP_LICENSE_ON_AMI_RESTORE:-yes}" == "yes" ]]; then
+            log "AMI restore detected (source instance ${stored}); creating skip marker."
+            touch "${SKIP_FILE}"
+          else
+            log "AMI restore detected but skipping auto-disable per configuration; updating source ID."
+          fi
+          echo "${INSTANCE_ID}" > "${SOURCE_ID_FILE}"
+        fi
+      }
+      should_skip_license() {
+        if [[ "${BCM_SKIP_LICENSE_ON_AMI_RESTORE:-yes}" == "yes" ]] && [[ -f "${SKIP_FILE}" ]]; then
+          log "License configuration skipped for AMI restore."
+          return 0
+        fi
+        if [[ -f "${ACTIVATED_FILE}" ]]; then
+          log "License already activated; nothing to do."
+          return 0
+        fi
+        return 1
+      }
+
+      ensure_awscli() {
+        if ! command -v aws >/dev/null 2>&1; then
+          dnf -y install awscli2 || dnf -y install awscli
+        fi
+      }
+
+      enable_core_services() {
+        systemctl enable --now chronyd
+        systemctl enable --now firewalld
+        systemctl enable --now amazon-ssm-agent
+        systemctl enable --now docker
+        mkdir -p /var/log/journal
+        systemd-tmpfiles --create --prefix /var/log/journal
+        systemctl restart systemd-journald
+        if command -v timedatectl >/dev/null 2>&1; then
+          timedatectl set-ntp true || true
+        fi
+        if getent group docker >/dev/null 2>&1; then
+          usermod -aG docker ec2-user || true
+        fi
+        sed -i 's/^apply_updates = no/apply_updates = yes/' /etc/dnf/automatic.conf
+        systemctl enable --now dnf-automatic-install.timer
+      }
+
+      install_nvidia_stack() {
+        local driver_installed="false"
+        if rpm -qa | grep -qi 'nvidia-driver' && [[ "${BCM_FORCE_DRIVER_INSTALL}" != "yes" ]]; then
+          driver_installed="true"
+          log "NVIDIA driver already present - skipping reinstall."
+        fi
+
+        if [[ "${driver_installed}" != "true" ]]; then
+          cat <<'EOF' >/etc/yum.repos.d/cuda-rhel9.repo
+[cuda-rhel9-x86_64]
+name=CUDA Repository
+baseurl=https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/
+enabled=1
+gpgcheck=1
+gpgkey=https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/3bf863cc.pub
+EOF
+          dnf clean expire-cache
+          dnf -y install kernel-devel-$(uname -r) kernel-headers-$(uname -r) gcc make dkms
+          dnf -y install nvidia-driver-latest-dkms cuda-toolkit nvidia-fabricmanager
+        fi
+
+        systemctl enable --now nvidia-persistenced
+        systemctl enable --now nvidia-fabricmanager || true
+        if command -v nvidia-modprobe >/dev/null 2>&1; then
+          nvidia-modprobe -u -c=0 || true
+        fi
+        nvidia-smi || log "nvidia-smi not yet available; driver install pending reboot."
+      }
+
+      install_bcm_stack() {
+        local install_check="${BCM_INSTALL_CHECK:-/opt/nvidia/bcm/bin/bcmctl}"
+
+        if [[ -n "${BCM_REPO_RPM:-}" ]]; then
+          log "Installing NVIDIA Base Command Manager repo RPM ${BCM_REPO_RPM}"
+          rpm -Uvh "${BCM_REPO_RPM}"
+        fi
+
+        if [[ -n "${BCM_INSTALLER_URL:-}" ]]; then
+          if [[ -z "${install_check}" ]] || [[ ! -x "${install_check}" ]]; then
+            local installer=/var/tmp/bcm-installer.run
+            log "Downloading Base Command Manager installer from ${BCM_INSTALLER_URL}"
+            if [[ "${BCM_INSTALLER_URL}" == s3://* ]]; then
+              aws s3 cp "${BCM_INSTALLER_URL}" "${installer}"
+            else
+              curl -fL "${BCM_INSTALLER_URL}" -o "${installer}"
+            fi
+            chmod +x "${installer}"
+            "${installer}" --quiet --non-interactive
+            rm -f "${installer}"
+          else
+            log "Skipping installer download; ${install_check} already present."
+          fi
+        fi
+
+        if [[ -n "${BCM_PACKAGES:-}" ]]; then
+          read -r -a bcm_pkgs <<<"${BCM_PACKAGES}"
+          if ((${#bcm_pkgs[@]})); then
+            dnf install -y "${bcm_pkgs[@]}"
+          fi
+        fi
+
+        if [[ -n "${BCM_SYSTEMD_SERVICES:-}" ]]; then
+          read -r -a bcm_svcs <<<"${BCM_SYSTEMD_SERVICES}"
+          for svc in "${bcm_svcs[@]}"; do
+            systemctl enable --now "${svc}" || log "Failed to enable ${svc}, please verify service name."
+          done
+        fi
+      }
+
+      fetch_license_material() {
+        local payload=""
+        case "${BCM_LICENSE_METHOD:-ssm-parameter}" in
+          secrets-manager)
+            if [[ -n "${BCM_LICENSE_SECRET_ARN:-}" ]]; then
+              payload="$(aws secretsmanager get-secret-value \
+                --secret-id "${BCM_LICENSE_SECRET_ARN}" \
+                --region "${REGION}" \
+                --query SecretString --output text 2>/dev/null || true)"
+            fi
+            ;;
+          inline)
+            payload="${BCM_LICENSE_TEXT:-}"
+            ;;
+          *)
+            if [[ -n "${BCM_LICENSE_PARAMETER_NAME:-}" ]]; then
+              payload="$(aws ssm get-parameter \
+                --name "${BCM_LICENSE_PARAMETER_NAME}" \
+                --with-decryption \
+                --region "${REGION}" \
+                --query Parameter.Value --output text 2>/dev/null || true)"
+            fi
+            ;;
+        esac
+        printf '%s' "${payload}"
+      }
+
+      configure_license() {
+        if should_skip_license; then
+          return 0
+        fi
+
+        local license_payload
+        license_payload="$(fetch_license_material)"
+        if [[ -z "${license_payload}" ]]; then
+          log "No license payload retrieved; leaving manual activation to operator."
+          return 0
+        fi
+
+        local target_dir="${BCM_LICENSE_TARGET_DIR:-/opt/nvidia/bcm/license}"
+        mkdir -p "${target_dir}"
+        local license_file="${target_dir}/bcm.lic"
+        printf '%s' "${license_payload}" > "${license_file}"
+        chmod 600 "${license_file}"
+
+        if command -v cl-license >/dev/null 2>&1; then
+          cl-license --import "${license_file}"
+          cl-license --activate --non-interactive
+        elif command -v bcmlicense >/dev/null 2>&1; then
+          bcmlicense --import "${license_file}"
+          bcmlicense --activate --non-interactive
+        else
+          log "Base Command Manager license utilities not found; stored license for manual activation."
+          return 0
+        fi
+
+        touch "${ACTIVATED_FILE}"
+        echo "${INSTANCE_ID}" > "${SOURCE_ID_FILE}"
+        rm -f "${SKIP_FILE}"
+        log "Base Command Manager license imported and activated."
+      }
+
+      main() {
+        log "Starting NVIDIA Base Command Manager bootstrap on ${INSTANCE_ID}"
+        ensure_awscli
+        detect_ami_restore
+        enable_core_services
+        install_nvidia_stack
+        install_bcm_stack
+        configure_license
+        log "NVIDIA Base Command Manager bootstrap completed successfully."
+      }
+
+      main "$@"
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, bcm-bootstrap.service ]
+
+final_message: |
+  NVIDIA Base Command Manager bootstrap for Amazon Linux 2023 complete. Review /var/log/bcm-bootstrap.log and /var/log/cloud-init.log for results.
