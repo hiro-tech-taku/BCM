@@ -1,0 +1,123 @@
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Pattern2: EC2にCreationPolicy + cfn-signalを設定。
+  UserDataでshutdownしてSignalが送られない場合、スタックはCREATE_FAILED/ROLLBACKになる。
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Amazon Linux 2 最新AMI（東京リージョン想定）
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: cfn-hirose-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: cfn-hirose-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: cfn-hirose-public-subnet-1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: cfn-hirose-public-rtb
+
+  PublicRouteDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from anywhere (hirose only)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: cfn-hirose-sg
+
+  hiroseInstanceWithCreationPolicy:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1          # 1つの成功シグナルを待つ
+        Timeout: PT3M     # 3分待つ（検証用に少し短め）
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cfn-hirose-ec2-with-creationpolicy
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          LOG=/var/log/user-data.log
+          echo "[INFO] UserData start" | tee ${LOG}
+          date >> ${LOG}
+
+          echo "[INFO] Sleep 30sec then shutdown BEFORE cfn-signal" | tee -a ${LOG}
+          sleep 30
+          echo "[INFO] Now shutdown -h now" | tee -a ${LOG}
+          shutdown -h now
+
+          # ※ここには本来 cfn-signal を書くが、
+          #   上の shutdown でインスタンスが停止するため、この行には到達しない想定。
+          #
+          # /opt/aws/bin/cfn-signal -e 0 \
+          #   --stack ${AWS::StackName} \
+          #   --resource hiroseInstanceWithCreationPolicy \
+          #   --region ${AWS::Region}
+
+Outputs:
+  InstanceId:
+    Value: !Ref hiroseInstanceWithCreationPolicy
+    Description: EC2 instance ID (with CreationPolicy)
