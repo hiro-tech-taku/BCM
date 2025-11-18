@@ -107,3 +107,49 @@ aws s3 cp "$BCM_LICENSE_S3_URI "$LICENSE_FILE"
 
 疑問
 この YAML をベースに、cluster.pem をどこから持ってくるか（AMI 内、S3、EFS…）
+
+エラーの原因は、ノードラベル内の `<br/>` などのHTMLが Mermaid の構文として解釈されてしまったことです。
+HTML をやめてシンプルなテキストだけにした版を作り直しました。
+
+```mermaid
+flowchart TD
+
+    A[開始: BCM ライセンス設定スクリプト起動] --> B[ログ出力先を設定しログファイルにリダイレクト]
+
+    B --> C{verify-license コマンドは存在するか?}
+
+    C -->|はい| D{verify-license の実行結果は有効か?}
+    C -->|いいえ| E[WARN ログ: verify-license なしとみなして続行]
+
+    D -->|はい| F[INFO ログ: 既に有効なライセンスあり]
+    F --> G[exit 0 で終了]
+
+    D -->|いいえ| H[INFO ログ: 有効なライセンスなしのためインストール続行]
+
+    E --> I[LICENSE_FILE=/cm/local/apps/cmd/etc/cluster.pem を設定]
+    H --> I
+
+    I --> J{LICENSE_FILE は存在するか?}
+
+    J -->|いいえ| K[ERROR ログ: ライセンスファイルなし]
+    K --> L[exit 1 で異常終了]
+
+    J -->|はい| M{install-license コマンドは存在するか?}
+
+    M -->|いいえ| N[ERROR ログ: install-license が見つからない]
+    N --> O[exit 1 で異常終了]
+
+    M -->|はい| P[INFO ログ: LICENSE_FILE からライセンスをインストール]
+
+    P --> Q[install-license LICENSE_FILE を実行]
+
+    Q --> R{verify-license を再実行しライセンス有効か確認}
+
+    R -->|はい| S[INFO ログ: ライセンス検証成功]
+    S --> T[INFO ログ: スクリプト正常終了]
+    T --> U[終了]
+
+    R -->|いいえ| V[ERROR ログ: インストール後の検証に失敗]
+    V --> W[exit 1 で異常終了]
+```
+
